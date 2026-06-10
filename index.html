@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
@@ -22,7 +22,7 @@
   <div id="app" style="padding: 1rem; max-width: 480px; margin: 0 auto;">
     <div style="margin-bottom: 1.2rem;">
       <div style="font-size: 18px; font-weight: 700; color: #111; letter-spacing: -0.3px;">智慧單懶人計算器</div>
-      <div style="font-size: 12px; color: #6B7280; margin-top: 3px;">輸入昨日收盤價 → 自動產生所有設定，直接抄去大戶投</div>
+      <div style="font-size: 12px; color: #6B7280; margin-top: 3px;">系統自動讀取昨日收盤價，直接抄去大戶投</div>
     </div>
 
     <div style="background: #F9FAFB; border-radius: 14px; padding: 1rem; margin-bottom: 1rem; border: 1px solid #E5E7EB;">
@@ -40,7 +40,7 @@
     <div id="strategy-container"></div>
 
     <div style="font-size: 10px; color: #D1D5DB; margin-top: 14px; line-height: 1.6;">
-      限價公式：昨收 × (1 − 觸發% + 1.5%) · 每次收盤後重新輸入最新收盤價更新 · 非投資建議
+      限價公式：昨收 × (1 − 觸發% + 1.5%) · 每次收盤後自動更新最新收盤價 · 非投資建議
     </div>
   </div>
 
@@ -84,7 +84,85 @@
       budget: "1wan"
     };
 
-    // --- 3. 邏輯計算 (Equivalent to useMemo) ---
+    // --- 3. 自動抓價與快取邏輯 (Auto Fetch API) ---
+    async function fetchYesterdayClosePrices() {
+      // 組合 3 檔 ETF 代號請求 Yahoo Finance (加上 .TW 後綴)
+      const symbols = "0050.TW,00878.TW,00991A.TW";
+      const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${symbols}`;
+      
+      // github.io 屬於純前端環境，必須透過免費的 allorigins CORS Proxy 繞過瀏覽器限制
+      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+      
+      try {
+        const response = await fetch(proxyUrl);
+        const data = await response.json();
+        // allorigins 會把結果包在 contents 字串中，需再次 Parse
+        const yahooData = JSON.parse(data.contents);
+        
+        const resultPrices = {};
+        if (yahooData?.quoteResponse?.result) {
+          yahooData.quoteResponse.result.forEach(stock => {
+            const code = stock.symbol.replace('.TW', '');
+            // 抓取昨日收盤價 (regularMarketPreviousClose) 作為基準
+            const price = stock.regularMarketPreviousClose || stock.regularMarketPrice;
+            if (price) resultPrices[code] = price.toFixed(2);
+          });
+        }
+        return resultPrices;
+      } catch (error) {
+        console.error("API 抓取收盤價失敗:", error);
+        return null;
+      }
+    }
+
+    async function loadPricesWithCache() {
+      // 取得台灣時間的當前日期字串 (例如 "2026/06/10")
+      const today = new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+      const cacheKey = "smartOrder_prices_cache";
+      const cachedData = JSON.parse(localStorage.getItem(cacheKey) || "{}");
+
+      // 1. 如果 LocalStorage 已經有今天的快取，直接套用，達成「秒開網頁」
+      if (cachedData.date === today && cachedData.prices) {
+        console.log("✅ 從快取讀取今日的昨日收盤價...");
+        state.prices = { ...state.prices, ...cachedData.prices };
+        syncPricesToInputs();
+        updateDynamicUI();
+        return;
+      }
+
+      // 2. 如果沒有快取或已經跨日，向 Yahoo API 抓取
+      console.log("🌐 跨日或無快取，背景自動向 API 抓取收盤價...");
+      const fetchedPrices = await fetchYesterdayClosePrices();
+      
+      if (fetchedPrices && Object.keys(fetchedPrices).length > 0) {
+        state.prices = { ...state.prices, ...fetchedPrices };
+        
+        // 寫入快取，今天之內重新整理網頁都不會再花時間重新抓取
+        localStorage.setItem(cacheKey, JSON.stringify({
+          date: today,
+          prices: fetchedPrices
+        }));
+        
+        syncPricesToInputs();
+        updateDynamicUI();
+      }
+    }
+
+    // 將資料同步填寫進 HTML 欄位中
+    function syncPricesToInputs() {
+      Object.keys(ETF_META).forEach(code => {
+        const inputEl = document.getElementById(`input-${code}`);
+        if (inputEl && state.prices[code]) {
+          inputEl.value = state.prices[code];
+          const meta = ETF_META[code];
+          // 觸發邊框及背景樣式變更
+          inputEl.style.borderColor = meta.accent;
+          inputEl.style.backgroundColor = meta.light;
+        }
+      });
+    }
+
+    // --- 4. 邏輯計算與 UI 渲染 ---
     function getComputed() {
       return BUDGET_ORDERS[state.budget].map(o => {
         const close = parseFloat(state.prices[o.etf]);
@@ -106,9 +184,8 @@
       return { g, i, v, total: g + i + v };
     }
 
-    // --- 4. 初始化與靜態綁定 ---
     function initUI() {
-      // 渲染輸入框 (只渲染一次，避免輸入時失焦)
+      // 渲染輸入框 (載入時顯示「讀取中」)
       const inputsContainer = document.getElementById('inputs-container');
       Object.entries(ETF_META).forEach(([code, meta]) => {
         const wrapper = document.createElement('div');
@@ -117,19 +194,19 @@
             <span style="width: 7px; height: 7px; border-radius: 2px; background: ${meta.accent}; flex-shrink: 0;"></span>
             <span style="font-size: 12px; font-weight: 600; color: ${meta.accent};">${code}</span>
           </div>
-          <input type="number" step="0.01" placeholder="昨收" id="input-${code}"
+          <input type="number" step="0.01" placeholder="讀取中..." id="input-${code}"
             style="width: 100%; padding: 7px 8px; border-radius: 8px; border: 1.5px solid #D1D5DB; font-size: 15px; font-weight: 600; outline: none; background: #fff; color: #111; transition: border-color 0.15s; box-sizing: border-box;"
           />
         `;
         inputsContainer.appendChild(wrapper);
 
+        // 如果想手動修改，依然保留連動功能
         const inputEl = document.getElementById(`input-${code}`);
         inputEl.addEventListener('input', (e) => {
           state.prices[code] = e.target.value;
-          // 動態更新輸入框的樣式
           inputEl.style.borderColor = e.target.value ? meta.accent : '#D1D5DB';
           inputEl.style.backgroundColor = e.target.value ? meta.light : '#fff';
-          updateDynamicUI(); // 觸發畫面更新
+          updateDynamicUI();
         });
       });
 
@@ -145,16 +222,18 @@
         btn.addEventListener('click', () => {
           state.budget = val;
           updateBudgetStyles();
-          updateDynamicUI(); // 觸發畫面更新
+          updateDynamicUI();
         });
         budgetToggle.appendChild(btn);
       });
 
       updateBudgetStyles();
-      updateDynamicUI(); // 初始渲染
+      updateDynamicUI();
+
+      // ★ 執行自動抓價與快取功能
+      loadPricesWithCache();
     }
 
-    // 更新預算按鈕的樣式
     function updateBudgetStyles() {
       ["1wan", "2wan"].forEach(val => {
         const btn = document.getElementById(`btn-${val}`);
@@ -170,13 +249,11 @@
       });
     }
 
-    // --- 5. 動態渲染 (Equivalent to React Rendering) ---
     function updateDynamicUI() {
       const computed = getComputed();
       const split = getSplit();
       const someReady = computed.some(o => o.ready);
 
-      // 更新資金配置 Bar
       document.getElementById('allocation-container').innerHTML = `
         <div style="background: #F9FAFB; border-radius: 10px; padding: 10px 12px; margin-bottom: 1rem; border: 1px solid #E5E7EB;">
           <div style="display: flex; justify-content: space-between; font-size: 11px; color: #6B7280; margin-bottom: 6px;">
@@ -196,14 +273,13 @@
         </div>
       `;
 
-      // 更新下方卡片與狀態
       const cardsContainer = document.getElementById('cards-container');
       const strategyContainer = document.getElementById('strategy-container');
 
       if (!someReady) {
         cardsContainer.innerHTML = `
           <div style="text-align: center; padding: 2.5rem 1rem; color: #9CA3AF; font-size: 13px; background: #F9FAFB; border-radius: 14px; border: 1.5px dashed #D1D5DB;">
-            ↑ 輸入昨日收盤價後自動產生設定
+            ↑ 價格讀取中，或請手動輸入昨日收盤價
           </div>
         `;
         strategyContainer.innerHTML = '';
@@ -257,7 +333,7 @@
                 <span style="margin-left: auto; font-size: 10px; padding: 2px 7px; border-radius: 4px; background: ${lv.tagBg}; color: ${lv.tagColor}; font-weight: 600;">${lv.label}</span>
               </div>
               <div style="font-size: 12px; color: #9CA3AF; text-align: center; padding: 8px 0;">
-                請輸入 ${o.etf} 昨日收盤價
+                價格讀取中，或請手動輸入 ${o.etf} 昨日收盤價
               </div>
             </div>`;
           }
@@ -275,7 +351,6 @@
         `;
       }
 
-      // 重新綁定複製按鈕事件
       document.querySelectorAll('.copy-btn').forEach(btn => {
         btn.addEventListener('click', (e) => {
           const text = e.target.getAttribute('data-copy');
