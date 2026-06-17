@@ -24,7 +24,7 @@
 		<div id="app" style="padding: 1rem; max-width: 480px; margin: 0 auto">
 			<div style="margin-bottom: 1.2rem">
 				<div style="font-size: 18px; font-weight: 700; color: #111; letter-spacing: -0.3px">智慧單懶人計算器</div>
-				<div style="font-size: 12px; color: #6b7280; margin-top: 3px">每次載入自動讀取昨日收盤價，直接抄去大戶投</div>
+				<div style="font-size: 12px; color: #6b7280; margin-top: 3px">系統自動讀取昨日收盤價，直接抄去大戶投</div>
 			</div>
 
 			<div style="background: #f9fafb; border-radius: 14px; padding: 1rem; margin-bottom: 1rem; border: 1px solid #e5e7eb">
@@ -41,21 +41,12 @@
 			<div id="cards-container"></div>
 			<div id="strategy-container"></div>
 
-			<div style="font-size: 10px; color: #d1d5db; margin-top: 14px; line-height: 1.6">限價公式：昨收 × (1 − 觸發% + 1.5%) · 每次重整皆會獲取最新收盤價 · 非投資建議</div>
+			<div style="font-size: 10px; color: #d1d5db; margin-top: 14px; line-height: 1.6">限價公式：昨收 × (1 − 觸發% + 1.5%) · 每日首次開啟自動抓取最新收盤價 · 非投資建議</div>
 		</div>
 
 		<script>
 			// --- 1. 常數設定 (Constants) ---
 			const LEVEL_CONFIG = {
-				lvStrong: {
-					pct: 1.8, // 跌幅較小（強勢）
-					buf: 1.0, // buffer 可以縮小
-					label: "強勢盤",
-					desc: "多頭趨勢 / 抗跌",
-					dotColor: "#10B981",
-					tagBg: "#D1FAE5",
-					tagColor: "#065F46"
-				},
 				lv1: { pct: 3.1, buf: 1.5, label: "正常修正", desc: "外資調節、消息面", dotColor: "#F59E0B", tagBg: "#FEF3C7", tagColor: "#92400E" },
 				lv2: { pct: 5.1, buf: 1.5, label: "市場恐慌", desc: "升息、地緣衝擊", dotColor: "#EF4444", tagBg: "#FEE2E2", tagColor: "#991B1B" },
 				lv3: { pct: 7.1, buf: 1.5, label: "重度崩跌", desc: "系統性崩盤", dotColor: "#7F1D1D", tagBg: "#7F1D1D", tagColor: "#FCA5A5" }
@@ -69,7 +60,6 @@
 
 			const BUDGET_ORDERS = {
 				"1wan": [
-					{ id: "強",etf: "0050", level: "lvStrong", amount: 2000, purpose: "強勢盤" },
 					{ id: "A", etf: "0050", level: "lv1", amount: 3500, purpose: "成長卡位" },
 					{ id: "B", etf: "00878", level: "lv1", amount: 2000, purpose: "領息防守" },
 					{ id: "C", etf: "0050", level: "lv2", amount: 2500, purpose: "成長加碼" },
@@ -94,10 +84,13 @@
 				budget: "1wan"
 			};
 
-			// --- 3. 自動抓價邏輯 (無快取版，透過 corsproxy.io 突破 CORS 限制) ---
+			// --- 3. 自動抓價與快取邏輯 (透過 corsproxy.io 突破 CORS 限制) ---
 			async function fetchSymbolPrice(symbol) {
 				try {
+					// 目標 Yahoo 網址
 					const targetUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.TW?interval=1d&range=1d&t=${Date.now()}`;
+
+					// 透過 corsproxy.io 作為跳板，完美繞過 github.io 的 CORS 阻擋
 					const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}`;
 
 					const res = await fetch(proxyUrl);
@@ -116,11 +109,25 @@
 				}
 			}
 
-			async function loadPrices() {
+			async function loadPricesWithCache() {
+				// 依台灣時間產生今日日期 (如 "2026/06/10")
+				const today = new Intl.DateTimeFormat("zh-TW", { timeZone: "Asia/Taipei", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+				const cacheKey = "smartOrder_prices_cache";
+				const cachedData = JSON.parse(localStorage.getItem(cacheKey) || "{}");
+
+				// 1. 若 LocalStorage 已有今日快取，直接套用 (秒開)
+				if (cachedData.date === today && cachedData.prices) {
+					state.prices = { ...state.prices, ...cachedData.prices };
+					syncPricesToInputs();
+					updateDynamicUI();
+					return;
+				}
+
+				// 2. 跨日或無快取，直接向 Yahoo 平行抓取 3 檔標的
 				const symbols = Object.keys(ETF_META);
 				const fetchedPrices = {};
 
-				// 平行抓取，互不影響
+				// Promise.all 平行處理：即使 00991A 抓不到，0050 和 00878 也會成功
 				await Promise.all(
 					symbols.map(async (code) => {
 						const price = await fetchSymbolPrice(code);
@@ -128,9 +135,16 @@
 					})
 				);
 
-				// 更新狀態 (不使用 localStorage)
+				// 更新狀態並寫入快取
 				if (Object.keys(fetchedPrices).length > 0) {
 					state.prices = { ...state.prices, ...fetchedPrices };
+					localStorage.setItem(
+						cacheKey,
+						JSON.stringify({
+							date: today,
+							prices: fetchedPrices
+						})
+					);
 				}
 
 				// 將數字放進輸入框並更新畫面
@@ -160,39 +174,13 @@
 				return BUDGET_ORDERS[state.budget].map((o) => {
 					const close = parseFloat(state.prices[o.etf]);
 					if (!close || close <= 0) return { ...o, ready: false };
-
 					const lv = LEVEL_CONFIG[o.level];
-
-					// ✅ 強勢盤判斷（核心）
-					let triggerMult, limitMult;
-
-					if (o.level === "lvStrong") {
-						// 強勢盤：回檔少、掛更貼近
-						triggerMult = 1 - lv.pct / 100;
-						limitMult = 1 - (lv.pct - lv.buf) / 100;
-
-						// 👉 額外策略：強勢盤直接再往上貼一點（搶成交）
-						limitMult += 0.002; // +0.2%
-					} else {
-						// 原本邏輯
-						triggerMult = 1 - lv.pct / 100;
-						limitMult = 1 - (lv.pct - lv.buf) / 100;
-					}
-
+					const triggerMult = 1 - lv.pct / 100;
+					const limitMult = 1 - (lv.pct - lv.buf) / 100;
 					const triggerPrice = close * triggerMult;
 					const limitPrice = close * limitMult;
-
 					const shares = Math.floor(o.amount / limitPrice);
-
-					return {
-						...o,
-						ready: true,
-						close,
-						triggerPrice: fmt(triggerPrice),
-						limitPrice: fmt(limitPrice),
-						shares,
-						approxCost: Math.round(shares * limitPrice)
-					};
+					return { ...o, ready: true, close, triggerPrice: fmt(triggerPrice), limitPrice: fmt(limitPrice), shares, approxCost: Math.round(shares * limitPrice) };
 				});
 			}
 
@@ -249,8 +237,8 @@
 				updateBudgetStyles();
 				updateDynamicUI();
 
-				// 載入完成後啟動無快取抓價
-				loadPrices();
+				// 載入完成後啟動自動抓價
+				loadPricesWithCache();
 			}
 
 			function updateBudgetStyles() {
